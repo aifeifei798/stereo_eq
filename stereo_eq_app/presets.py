@@ -1,19 +1,51 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 
 from .models import EqBand, EqPreset
 
-_BANDS = (60.0, 250.0, 1000.0, 3500.0, 10000.0)
-_Q = (0.8, 0.9, 0.9, 0.8, 0.7)
-_TYPES = ("low_shelf", "peaking", "peaking", "peaking", "high_shelf")
+# VLC 风格的立体声均衡器频段。保留为公开常量，方便 UI 和测试引用。
+VLC_BAND_FREQUENCIES = (60.0, 170.0, 310.0, 600.0, 1000.0, 3000.0, 12000.0, 14000.0, 16000.0)
+VLC_BAND_TYPES = (
+    "low_shelf",
+    "peaking",
+    "peaking",
+    "peaking",
+    "peaking",
+    "peaking",
+    "peaking",
+    "peaking",
+    "high_shelf",
+)
+VLC_BAND_Q = (0.8, 0.9, 0.9, 0.9, 0.9, 0.9, 0.8, 0.8, 0.7)
+
+_OLD_BAND_FREQUENCIES = (60.0, 250.0, 1000.0, 3500.0, 10000.0)
+
+
+def _expanded_gain(value: tuple[float, ...], index: int) -> float:
+    """Interpolate the old five-band preset data onto the VLC layout."""
+    frequency = VLC_BAND_FREQUENCIES[index]
+    if frequency <= _OLD_BAND_FREQUENCIES[0]:
+        return float(value[0])
+    if frequency >= _OLD_BAND_FREQUENCIES[-1]:
+        return float(value[-1])
+    for old_index in range(len(_OLD_BAND_FREQUENCIES) - 1):
+        left_frequency = _OLD_BAND_FREQUENCIES[old_index]
+        right_frequency = _OLD_BAND_FREQUENCIES[old_index + 1]
+        if left_frequency <= frequency <= right_frequency:
+            ratio = (math.log(frequency) - math.log(left_frequency)) / (
+                math.log(right_frequency) - math.log(left_frequency)
+            )
+            return float(value[old_index] + (value[old_index + 1] - value[old_index]) * ratio)
+    raise AssertionError("无法将五段预设迁移到九段频段")
 
 
 def _band(index: int, gain: float) -> EqBand:
     return EqBand(
-        filter_type=_TYPES[index],
-        frequency=_BANDS[index],
-        q=_Q[index],
+        filter_type=VLC_BAND_TYPES[index],
+        frequency=VLC_BAND_FREQUENCIES[index],
+        q=VLC_BAND_Q[index],
         gain_db=gain,
     )
 
@@ -26,13 +58,18 @@ def _preset(
     preamp_db: float,
     gains: Iterable[float],
 ) -> EqPreset:
+    values = tuple(float(value) for value in gains)
+    if len(values) == 5:
+        values = tuple(_expanded_gain(values, index) for index in range(len(VLC_BAND_FREQUENCIES)))
+    if len(values) != len(VLC_BAND_FREQUENCIES):
+        raise ValueError("内置预设必须包含五个旧频段或九个 VLC 频段的增益")
     return EqPreset(
         preset_id=preset_id,
         name=name,
         category=category,
         description=description,
         preamp_db=preamp_db,
-        bands=[_band(index, gain) for index, gain in enumerate(gains)],
+        bands=[_band(index, gain) for index, gain in enumerate(values)],
     )
 
 
@@ -100,7 +137,6 @@ _ELECTRONIC = [
     ("electronic-headphone", "电子耳机", "平衡电子乐的频宽和低频", -1.0, (2, 0, 1, 2, 2)),
     ("electronic-live", "电子现场", "适合现场电子音乐播放", -1.0, (3, 1, 1, 2, 2)),
 ]
-
 
 _MOVIE = [
     ("movie-dialogue", "对白清晰", "突出电影对白和剧情对白的清晰度", -1.0, (0, 0, 3, 2, -1)),

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .effects import EffectChain
 from .models import EqBand, EqPreset, FilterType
 
 
@@ -174,7 +175,9 @@ class DspEngine:
         self.sample_rate = sample_rate
         self.channels = channels
         self._active = BiquadBank(preset, sample_rate, channels)
+        self._active_effects = EffectChain(preset.effects, sample_rate, channels)
         self._target: BiquadBank | None = None
+        self._target_effects: EffectChain | None = None
         self._crossfade_remaining = 0
         self._crossfade_total = max(1, sample_rate // 100)
         self._crossfade_weights = np.linspace(1.0, 0.0, self._crossfade_total, dtype=np.float32)[:, np.newaxis]
@@ -189,7 +192,9 @@ class DspEngine:
 
     def set_preset(self, preset: EqPreset) -> None:
         target = BiquadBank(preset, self.sample_rate, self.channels)
+        target_effects = EffectChain(preset.effects, self.sample_rate, self.channels)
         self._target = target
+        self._target_effects = target_effects
         self._crossfade_remaining = self._crossfade_total
 
     def set_bypass(self, enabled: bool) -> None:
@@ -202,10 +207,14 @@ class DspEngine:
             self.latest_peak = float(np.max(np.abs(source))) if source.size else 0.0
             return source
         elif self._target is None:
-            result = self._active.process(source)
+            result = self._active_effects.process(self._active.process(source))
         else:
-            current = self._active.process(source)
-            target = self._target.process(source)
+            current = self._active_effects.process(self._active.process(source))
+            target = (
+                self._target_effects.process(self._target.process(source))
+                if self._target_effects is not None
+                else self._target.process(source)
+            )
             count = min(source.shape[0], self._crossfade_remaining)
             if count:
                 old_weight = self._crossfade_weights[self._crossfade_total - count :]
@@ -218,7 +227,10 @@ class DspEngine:
             self._crossfade_remaining -= count
             if self._crossfade_remaining <= 0:
                 self._active = self._target
+                if self._target_effects is not None:
+                    self._active_effects = self._target_effects
                 self._target = None
+                self._target_effects = None
         result = self._limiter.process(result)
         self.latest_peak = float(np.max(np.abs(result))) if result.size else 0.0
         return result[:, 0] if was_one_dimensional and result.ndim == 2 else result

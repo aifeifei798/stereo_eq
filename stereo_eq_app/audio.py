@@ -58,11 +58,13 @@ class SystemOutputMonitor:
     def __init__(
         self,
         pre_source_name: str = "stereo_eq_input.monitor",
-        post_source_name: str = "stereo_eq_post.monitor",
+        post_source_name: str | None = "stereo_eq_post.monitor",
         sample_rate: int = 48000,
         channels: int = 2,
     ) -> None:
-        self.source_names = {"pre": pre_source_name, "post": post_source_name}
+        self.source_names = {"pre": pre_source_name}
+        if post_source_name is not None:
+            self.source_names["post"] = post_source_name
         self.sample_rate = sample_rate
         self.channels = channels
         self.peaks = {"pre": 0.0, "post": 0.0}
@@ -91,7 +93,7 @@ class SystemOutputMonitor:
         try:
             for key, source_name in self.source_names.items():
                 self._start_source(key, source_name)
-        except OSError:
+        except (OSError, RuntimeError):
             self.stop()
             raise
 
@@ -146,6 +148,172 @@ class SystemOutputMonitor:
         self._processes.clear()
         self._threads.clear()
         self.peaks = {"pre": 0.0, "post": 0.0}
+
+
+class SystemEffectBridge:
+    """在不支持 FFmpeg/LADSPA 的 PipeWire 上用 Python 处理系统音频。"""
+
+    def __init__(
+        self,
+        dsp: DspEngine,
+        source_name: str,
+        target_sink: str,
+        sample_rate: int = 48000,
+        channels: int = 2,
+    ) -> None:
+        self.dsp = dsp
+        self.source_name = source_name
+        self.target_sink = target_sink
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.input_peak = 0.0
+        self.processed_peak = 0.0
+        self.last_error = ""
+        self._capture: subprocess.Popen[bytes] | None = None
+        self._playback: subprocess.Popen[bytes] | None = None
+        self._thread: threading.Thread | None = None
+        self._running = False
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def start(self) -> None:
+        if self._running:
+            return
+        if not shutil.which("parec"):
+            raise RuntimeError("未找到 parec，无法读取系统 EQ 输入")
+        if not shutil.which("pacat"):
+            raise RuntimeError("未找到 pacat，无法输出系统 EQ 后音频")
+        self.last_error = ""
+        capture_command = [
+            "parec",
+            "--device=" + self.source_name,
+            "--format=float32le",
+            f"--rate={self.sample_rate}",
+            f"--channels={self.channels}",
+            "--latency-msec=20",
+        ]
+        playback_command = [
+            "pacat",
+            "--device=" + self.target_sink,
+            "--format=float32le",
+            f"--rate={self.sample_rate}",
+            f"--channels={self.channels}",
+            "--latency-msec=20",
+        ]
+        try:
+            self._capture = subprocess.Popen(
+                capture_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+            self._playback = subprocess.Popen(
+                playback_command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+        except OSError:
+            self.stop()
+            raise
+        self._thread = threading.Thread(target=self._run, name="stereo-eq-system-effect-bridge", daemon=True)
+        self._running = True
+        self._thread.start()
+
+    def _read_exact(self, stream, size: int) -> bytes | None:
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining > 0 and self._running:
+            data = stream.read(remaining)
+            if not data:
+                return None
+            chunks.append(data)
+            remaining -= len(data)
+        if remaining > 0:
+            return None
+        return b"".join(chunks)
+
+    def _run(self) -> None:
+        capture = self._capture
+        playback = self._playback
+        if capture is None or capture.stdout is None or playback is None or playback.stdin is None:
+            self.last_error = "系统效果桥接进程没有正确启动"
+            self._running = False
+            return
+        frame_bytes = self.channels * np.dtype("<f4").itemsize
+        chunk_frames = 1024
+        chunk_bytes = chunk_frames * frame_bytes
+        capture_stream = capture.stdout
+        playback_stream = playback.stdin
+        try:
+            while self._running and capture.poll() is None:
+                if playback.poll() is not None:
+                    self.last_error = "系统输出 pacat 已退出，可能是输出设备被切换"
+                    break
+                data = self._read_exact(capture_stream, chunk_bytes)
+                if data is None:
+                    break
+                block = np.frombuffer(data, dtype="<f4").reshape(-1, self.channels).copy()
+                self.input_peak = float(np.max(np.abs(block))) if block.size else 0.0
+                try:
+                    processed = self.dsp.process(block)
+                except (RuntimeError, ValueError) as error:
+                    self.last_error = f"系统效果处理失败: {error}"
+                    break
+                if processed.shape[1] != self.channels:
+                    fixed = np.zeros_like(block)
+                    copy_channels = min(processed.shape[1], self.channels)
+                    fixed[:, :copy_channels] = processed[:, :copy_channels]
+                    processed = fixed
+                payload = np.ascontiguousarray(processed, dtype="<f4").tobytes()
+                try:
+                    playback_stream.write(payload)
+                    playback_stream.flush()
+                except (BrokenPipeError, OSError, ValueError) as error:
+                    self.last_error = f"系统效果输出断开: {error}"
+                    break
+                self.processed_peak = float(np.max(np.abs(processed))) if processed.size else 0.0
+                if capture.poll() is not None:
+                    break
+        except (OSError, ValueError) as error:
+            if self._running:
+                self.last_error = f"系统效果桥接错误: {error}"
+        finally:
+            self._running = False
+
+    def stop(self) -> None:
+        self._running = False
+        if self._capture is not None:
+            if self._capture.poll() is None:
+                self._capture.terminate()
+            try:
+                self._capture.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self._capture.kill()
+                self._capture.wait(timeout=1)
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+        if self._playback is not None:
+            if self._playback.stdin is not None:
+                try:
+                    self._playback.stdin.close()
+                except OSError:
+                    pass
+            if self._playback.poll() is None:
+                self._playback.terminate()
+            try:
+                self._playback.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self._playback.kill()
+                self._playback.wait(timeout=1)
+        self._capture = None
+        self._playback = None
+        self._thread = None
+        self.input_peak = 0.0
+        self.processed_peak = 0.0
 
 
 class MicMonitor:

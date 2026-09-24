@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 from PyQt6.QtCore import Qt, QTimer
@@ -27,11 +27,19 @@ from PyQt6.QtWidgets import (
     QSlider,
     QSplitter,
     QTableWidget,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from .audio import AudioDevice, MicMonitor, SystemOutputMonitor, list_input_devices, list_output_devices
+from .audio import (
+    AudioDevice,
+    MicMonitor,
+    SystemEffectBridge,
+    SystemOutputMonitor,
+    list_input_devices,
+    list_output_devices,
+)
 from .config import PresetStore, load_state, save_state
 from .dsp import BiquadBank, DspEngine
 from .models import AppState, EqBand, EqPreset, FilterType
@@ -89,16 +97,42 @@ class MainWindow(QMainWindow):
         self.state: AppState = load_state()
         self.store = PresetStore()
         self.pipewire = PipeWireController()
-        self.system_meter = SystemOutputMonitor()
+        self.system_meter = SystemOutputMonitor(
+            post_source_name=None if self.pipewire.effect_bridge_mode else "stereo_eq_post.monitor"
+        )
         self.dsp: DspEngine | None = None
+        self.system_bridge: SystemEffectBridge | None = None
         self.monitor: MicMonitor | None = None
         self._loading = False
         self._last_selected_id = self.state.selected_preset_id
+        self.band_sliders: dict[int, QSlider] = {}
+        self.band_slider_labels: dict[int, QLabel] = {}
+        self.band_gain_spins: dict[int, QDoubleSpinBox] = {}
+        self.effect_enabled_checks: dict[str, QCheckBox] = {}
+        self.effect_sliders: dict[str, dict[str, QSlider]] = {}
+        self.effect_labels: dict[str, dict[str, QLabel]] = {}
+        self.effect_scales: dict[str, dict[str, float]] = {}
+        self.effect_decimals: dict[str, dict[str, int]] = {}
+        self.effect_units: dict[str, dict[str, str]] = {}
+        self._effect_system_timer = QTimer(self)
+        self._effect_system_timer.setSingleShot(True)
+        self._effect_system_timer.timeout.connect(self._effect_system_update)
+        self._system_eq_update_timer = QTimer(self)
+        self._system_eq_update_timer.setSingleShot(True)
+        self._system_eq_update_timer.timeout.connect(self._system_eq_update)
+        self._system_bridge_watchdog = QTimer(self)
+        self._system_bridge_watchdog.setInterval(1000)
+        self._system_bridge_watchdog.timeout.connect(self._check_system_bridge)
+        self._system_bridge_watchdog.start()
         self._build_ui()
         self._refresh_devices()
         self._refresh_presets()
         self._select_preset(self.state.selected_preset_id)
         if self.pipewire.active:
+            if self.pipewire.effect_bridge_mode:
+                preset = self._current_preset()
+                if preset is not None:
+                    self._start_system_effect_bridge(preset)
             self._start_system_meter()
             self.status_label.setText("系统输出已接管；系统输出电平正在监听")
         self._status_timer = QTimer(self)
@@ -174,10 +208,31 @@ class MainWindow(QMainWindow):
         if horizontal_header is not None:
             horizontal_header.setStretchLastSection(False)
             horizontal_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        right_layout.addWidget(self.band_table, 1)
+        band_tab = QWidget()
+        band_tab_layout = QVBoxLayout(band_tab)
+        band_tab_layout.setContentsMargins(4, 4, 4, 4)
+        band_tab_layout.addWidget(self._build_band_slider_panel())
+        band_tab_layout.addStretch(1)
+
+        advanced_eq_tab = QWidget()
+        advanced_eq_layout = QVBoxLayout(advanced_eq_tab)
+        advanced_eq_layout.setContentsMargins(4, 4, 4, 4)
+        advanced_eq_layout.addWidget(self.band_table, 1)
         add_button = QPushButton("添加频段")
         add_button.clicked.connect(self._add_band)
-        right_layout.addWidget(add_button, 0, Qt.AlignmentFlag.AlignLeft)
+        advanced_eq_layout.addWidget(add_button, 0, Qt.AlignmentFlag.AlignLeft)
+
+        effect_tab = QWidget()
+        effect_tab_layout = QVBoxLayout(effect_tab)
+        effect_tab_layout.setContentsMargins(4, 4, 4, 4)
+        effect_tab_layout.addWidget(self._build_effect_panel())
+        effect_tab_layout.addStretch(1)
+
+        self.control_tabs = QTabWidget()
+        self.control_tabs.addTab(band_tab, "九段 EQ")
+        self.control_tabs.addTab(advanced_eq_tab, "高级九段 EQ")
+        self.control_tabs.addTab(effect_tab, "音频效果")
+        right_layout.addWidget(self.control_tabs, 1)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(left_panel)
@@ -250,6 +305,365 @@ class MainWindow(QMainWindow):
         status_layout.addStretch(1)
         root_layout.addLayout(status_layout)
         self._update_system_controls()
+
+    def _build_band_slider_panel(self) -> QGroupBox:
+        panel = QGroupBox("九段 EQ（竖向调节）")
+        layout = QHBoxLayout(panel)
+        self.band_slider_frequency_labels: dict[int, QLabel] = {}
+        for index in range(9):
+            column = QWidget()
+            column_layout = QVBoxLayout(column)
+            column_layout.setContentsMargins(2, 2, 2, 2)
+            frequency_label = QLabel()
+            frequency_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            column_layout.addWidget(frequency_label)
+            slider = QSlider(Qt.Orientation.Vertical)
+            slider.setRange(-200, 200)
+            slider.setSingleStep(1)
+            slider.setPageStep(10)
+            slider.setMinimumHeight(105)
+            slider.setMaximumWidth(42)
+            slider.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            slider.setToolTip("左右声道共同增益：±20 dB，滚轮/键盘上下 0.1 dB")
+
+            def slider_changed(value: int, band_index: int = index) -> None:
+                self._band_slider_changed(band_index, value)
+
+            slider.valueChanged.connect(slider_changed)
+            column_layout.addWidget(slider)
+            value_label = QLabel("0.0 dB")
+            value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            column_layout.addWidget(value_label)
+            gain_spin = QDoubleSpinBox()
+            gain_spin.setRange(-20.0, 20.0)
+            gain_spin.setSingleStep(0.1)
+            gain_spin.setDecimals(1)
+            gain_spin.setSuffix(" dB")
+            gain_spin.setMaximumWidth(90)
+            gain_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            gain_spin.setToolTip("直接输入增益：±20 dB，步进 0.1 dB")
+
+            def spin_changed(value: float, band_index: int = index) -> None:
+                self._band_spin_changed(band_index, value)
+
+            gain_spin.valueChanged.connect(spin_changed)
+            column_layout.addWidget(gain_spin)
+            layout.addWidget(column)
+            self.band_sliders[index] = slider
+            self.band_slider_frequency_labels[index] = frequency_label
+            self.band_slider_labels[index] = value_label
+            self.band_gain_spins[index] = gain_spin
+        return panel
+
+    @staticmethod
+    def _format_frequency(frequency: float) -> str:
+        if frequency >= 1000.0:
+            return f"{frequency / 1000.0:g}k"
+        return f"{frequency:g}"
+
+    def _populate_band_sliders(self, preset: EqPreset) -> None:
+        for index in range(9):
+            slider = self.band_sliders[index]
+            frequency_label = self.band_slider_frequency_labels[index]
+            value_label = self.band_slider_labels[index]
+            gain_spin = self.band_gain_spins[index]
+            if index >= len(preset.bands):
+                slider.setVisible(False)
+                frequency_label.setVisible(False)
+                value_label.setVisible(False)
+                gain_spin.setVisible(False)
+                continue
+            band = preset.bands[index]
+            gain = (band.left_gain() + band.right_gain()) / 2.0
+            slider.setVisible(True)
+            frequency_label.setVisible(True)
+            value_label.setVisible(True)
+            gain_spin.setVisible(True)
+            frequency_label.setText(f"{self._format_frequency(band.frequency)} Hz")
+            slider.blockSignals(True)
+            slider.setValue(int(round(gain * 10.0)))
+            slider.blockSignals(False)
+            gain_spin.blockSignals(True)
+            gain_spin.setValue(round(gain, 1))
+            gain_spin.blockSignals(False)
+            value_label.setText(f"{gain:.1f} dB")
+
+    def _apply_band_gain(self, row: int, gain: float) -> None:
+        preset = self._current_preset()
+        if preset is None or row >= len(preset.bands):
+            return
+        band = preset.bands[row]
+        band.gain_db = gain
+        band.left_gain_db = gain
+        band.right_gain_db = gain
+        for column in (4, 5):
+            spin = cast(QDoubleSpinBox, self.band_table.cellWidget(row, column))
+            spin.blockSignals(True)
+            spin.setValue(gain)
+            spin.blockSignals(False)
+        slider = self.band_sliders[row]
+        slider.blockSignals(True)
+        slider.setValue(int(round(gain * 10.0)))
+        slider.blockSignals(False)
+        gain_spin = self.band_gain_spins[row]
+        gain_spin.blockSignals(True)
+        gain_spin.setValue(round(gain, 1))
+        gain_spin.blockSignals(False)
+        self.band_slider_labels[row].setText(f"{gain:.1f} dB")
+        self.graph.set_preset(preset, int(self.sample_rate_combo.currentText()))
+        self._apply_preset(preset)
+        self._schedule_system_eq_update()
+
+    def _band_slider_changed(self, row: int, value: int) -> None:
+        if self._loading:
+            return
+        self._apply_band_gain(row, value / 10.0)
+
+    def _band_spin_changed(self, row: int, value: float) -> None:
+        if self._loading:
+            return
+        gain = round(float(value), 1)
+        gain = max(-20.0, min(20.0, gain))
+        self._apply_band_gain(row, gain)
+
+    def _build_effect_panel(self) -> QGroupBox:
+        specs: dict[str, tuple[str, list[tuple[str, str, float, float, float, int, str]]]] = {
+            "compressor": (
+                "压缩器",
+                [
+                    ("threshold_db", "阈值", -60.0, 0.0, 10.0, 1, " dB"),
+                    ("ratio", "压缩比", 1.0, 20.0, 10.0, 1, ":1"),
+                    ("attack_ms", "启动", 0.1, 2000.0, 10.0, 1, " ms"),
+                    ("release_ms", "释放", 1.0, 9000.0, 1.0, 0, " ms"),
+                    ("knee_db", "拐点", 0.0, 24.0, 1.0, 0, " dB"),
+                    ("makeup_gain_db", "补偿", -24.0, 24.0, 1.0, 0, " dB"),
+                    ("mix", "混合", 0.0, 1.0, 100.0, 0, ""),
+                ],
+            ),
+            "spatial_locator": (
+                "声场定位器",
+                [
+                    ("pan", "左右", -1.0, 1.0, 100.0, 2, ""),
+                    ("mix", "混合", 0.0, 1.0, 100.0, 0, ""),
+                ],
+            ),
+            "stereo_widener": (
+                "立体声扩展器",
+                [
+                    ("width", "宽度", 0.0, 2.0, 100.0, 2, "×"),
+                    ("mix", "混合", 0.0, 1.0, 100.0, 0, ""),
+                ],
+            ),
+            "sound_booster": (
+                "声音放大器",
+                [
+                    ("gain_db", "增益", 0.0, 12.0, 10.0, 1, " dB"),
+                    ("mix", "混合", 0.0, 1.0, 100.0, 0, ""),
+                ],
+            ),
+        }
+        panel = QGroupBox("音频效果（竖向调节）")
+        panel_layout = QHBoxLayout(panel)
+        for effect, (title, controls) in specs.items():
+            effect_group = QGroupBox(title)
+            effect_layout = QHBoxLayout(effect_group)
+            enabled = QCheckBox("启用")
+            enabled.toggled.connect(
+                lambda checked, effect=effect: self._effect_enabled_changed(effect, checked)
+            )
+            effect_layout.addWidget(enabled)
+            self.effect_enabled_checks[effect] = enabled
+            self.effect_sliders[effect] = {}
+            self.effect_labels[effect] = {}
+            self.effect_scales[effect] = {}
+            self.effect_decimals[effect] = {}
+            self.effect_units[effect] = {}
+            for key, label_text, minimum, maximum, scale, decimals, unit in controls:
+                column = QWidget()
+                column_layout = QVBoxLayout(column)
+                column_layout.setContentsMargins(2, 2, 2, 2)
+                column_layout.addWidget(QLabel(label_text))
+                slider = QSlider(Qt.Orientation.Vertical)
+                slider.setRange(int(round(minimum * scale)), int(round(maximum * scale)))
+                slider.setSingleStep(max(1, int(round(scale))))
+                slider.setMinimumHeight(115)
+                slider.setMaximumWidth(42)
+                slider.setToolTip(f"{label_text}: {minimum:g} 到 {maximum:g}{unit}")
+
+                def value_changed(
+                    value: int,
+                    effect_name: str = effect,
+                    parameter: str = key,
+                    scale_value: float = scale,
+                    precision: int = decimals,
+                    suffix: str = unit,
+                ) -> None:
+                    self._effect_value_changed(
+                        effect_name,
+                        parameter,
+                        value / scale_value,
+                        precision,
+                        suffix,
+                    )
+
+                slider.valueChanged.connect(value_changed)
+                column_layout.addWidget(slider)
+                value_label = QLabel("0")
+                value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                column_layout.addWidget(value_label)
+                effect_layout.addWidget(column)
+                self.effect_sliders[effect][key] = slider
+                self.effect_labels[effect][key] = value_label
+                self.effect_scales[effect][key] = scale
+                self.effect_decimals[effect][key] = decimals
+                self.effect_units[effect][key] = unit
+            panel_layout.addWidget(effect_group)
+        return panel
+
+    def _populate_effects(self, preset: EqPreset) -> None:
+        for effect, check in self.effect_enabled_checks.items():
+            effect_settings: Any = getattr(preset.effects, effect)
+            check.blockSignals(True)
+            check.setChecked(bool(effect_settings.enabled))
+            check.blockSignals(False)
+            for key, slider in self.effect_sliders[effect].items():
+                value = float(getattr(effect_settings, key))
+                scale = self.effect_scales[effect][key]
+                decimals = self.effect_decimals[effect][key]
+                unit = self.effect_units[effect][key]
+                slider.blockSignals(True)
+                slider.setValue(int(round(value * scale)))
+                slider.setEnabled(bool(effect_settings.enabled))
+                slider.blockSignals(False)
+                self.effect_labels[effect][key].setText(f"{value:.{decimals}f}{unit}")
+
+    def _effect_enabled_changed(self, effect: str, enabled: bool) -> None:
+        if self._loading:
+            return
+        preset = self._current_preset()
+        if preset is None:
+            return
+        effect_settings: Any = getattr(preset.effects, effect)
+        effect_settings.enabled = enabled
+        for slider in self.effect_sliders[effect].values():
+            slider.setEnabled(enabled)
+        self._effect_changed(preset)
+
+    def _effect_value_changed(self, effect: str, key: str, value: float, decimals: int, unit: str) -> None:
+        if self._loading:
+            return
+        preset = self._current_preset()
+        if preset is None:
+            return
+        effect_settings: Any = getattr(preset.effects, effect)
+        setattr(effect_settings, key, float(value))
+        self.effect_labels[effect][key].setText(f"{value:.{decimals}f}{unit}")
+        self._effect_changed(preset)
+
+    def _effect_changed(self, preset: EqPreset) -> None:
+        if self.dsp is not None:
+            try:
+                self.dsp.set_preset(preset)
+            except (RuntimeError, ValueError) as error:
+                self.status_label.setText(f"监听效果更新失败：{error}")
+        if not self.pipewire.active:
+            return
+        if self.system_bridge is not None:
+            try:
+                self.system_bridge.dsp.set_preset(preset)
+            except (RuntimeError, ValueError) as error:
+                self.status_label.setText(f"系统效果更新失败：{error}")
+            return
+        # 还没有桥接时防抖，避免拖动滑杆时反复重启 PipeWire
+        self._effect_system_timer.start(250)
+
+    def _schedule_system_eq_update(self) -> None:
+        if self.system_bridge is not None:
+            preset = self._current_preset()
+            if preset is not None:
+                self.system_bridge.dsp.set_preset(preset)
+        elif self.pipewire.active:
+            self._system_eq_update_timer.start(350)
+
+    def _system_eq_update(self) -> None:
+        preset = self._current_preset()
+        if preset is None or not self.pipewire.active or self.system_bridge is not None:
+            return
+        try:
+            self.pipewire.update(preset, self.system_sink_combo.currentData())
+            self.system_meter.stop()
+            self._start_system_meter()
+        except (RuntimeError, OSError, ValueError) as error:
+            self.status_label.setText(f"系统 EQ 更新失败：{error}")
+
+    def _effect_system_update(self) -> None:
+        preset = self._current_preset()
+        if preset is None or not self.pipewire.active:
+            return
+        if self.system_bridge is not None:
+            try:
+                self.system_bridge.dsp.set_preset(preset)
+            except (RuntimeError, ValueError) as error:
+                self.status_label.setText(f"系统效果更新失败：{error}")
+            return
+        try:
+            if preset.effects.any_enabled():
+                self._switch_to_system_effect_bridge(preset)
+                self.status_label.setText(f"系统输出已自动切换到：{preset.name}（效果桥接）")
+            else:
+                self.pipewire.update(preset, self.system_sink_combo.currentData())
+        except (RuntimeError, OSError, ValueError) as error:
+            self.status_label.setText(f"音频效果更新失败：{error}")
+
+    def _physical_system_target(self) -> str | None:
+        target = self.system_sink_combo.currentData() or self.pipewire.previous_sink
+        if target in {None, "stereo_eq_input", "stereo_eq_post"}:
+            target = next((sink.name for sink in self.pipewire.list_sinks()), None)
+        return target
+
+    def _start_system_effect_bridge(self, preset: EqPreset) -> None:
+        if self.system_bridge is not None:
+            self.system_bridge.stop()
+        target = self._physical_system_target()
+        if target is None:
+            raise RuntimeError("没有找到可用的真实输出设备")
+        bridge = SystemEffectBridge(
+            DspEngine(preset, 48000, 2),
+            self.pipewire.pre_monitor_source,
+            target,
+        )
+        bridge.start()
+        self.system_bridge = bridge
+        self.system_meter.source_names = {"post": f"{target}.monitor"}
+        self.system_meter.stop()
+        self._start_system_meter()
+
+    def _check_system_bridge(self) -> None:
+        if self.system_bridge is None or not self.pipewire.active or self.system_bridge.running:
+            return
+        preset = self._current_preset()
+        if preset is None:
+            return
+        self.system_bridge.stop()
+        self.system_bridge = None
+        try:
+            self._start_system_effect_bridge(preset)
+        except (RuntimeError, OSError, ValueError) as error:
+            self.status_label.setText(f"系统效果桥接重连失败：{error}")
+
+    def _switch_to_system_effect_bridge(self, preset: EqPreset) -> None:
+        target = self._physical_system_target()
+        if target is None:
+            raise RuntimeError("没有找到可用的真实输出设备")
+        if self.system_bridge is not None:
+            self.system_bridge.stop()
+            self.system_bridge = None
+        # 已在纯 EQ 模式时只重启一次，直接 update 到桥接配置
+        if self.pipewire.active and not self.pipewire.effect_bridge_mode:
+            self.pipewire.update(preset, target)
+        elif not self.pipewire.active:
+            self.pipewire.activate(preset, target)
+        self._start_system_effect_bridge(preset)
 
     def _create_meters(self) -> tuple[QProgressBar, QProgressBar, QProgressBar, QProgressBar, QProgressBar]:
         meters = []
@@ -351,6 +765,7 @@ class MainWindow(QMainWindow):
         self.state.selected_preset_id = preset.preset_id
         self._loading = True
         self._populate_bands(preset)
+        self._populate_effects(preset)
         self.graph.set_preset(preset, int(self.sample_rate_combo.currentText()))
         self._loading = False
         self._apply_preset(preset, apply_system=True)
@@ -370,11 +785,12 @@ class MainWindow(QMainWindow):
             self.band_table.setCellWidget(row, 1, type_combo)
             self._set_spin(row, 2, band.frequency, 20.0, 20000.0, 1.0)
             self._set_spin(row, 3, band.q, 0.1, 20.0, 0.1)
-            self._set_spin(row, 4, band.left_gain(), -60.0, 60.0, 0.1)
-            self._set_spin(row, 5, band.right_gain(), -60.0, 60.0, 0.1)
+            self._set_spin(row, 4, band.left_gain(), -20.0, 20.0, 0.1)
+            self._set_spin(row, 5, band.right_gain(), -20.0, 20.0, 0.1)
             delete_button = QPushButton("×")
             delete_button.clicked.connect(lambda _checked=False, row=row: self._delete_band(row))
             self.band_table.setCellWidget(row, 6, delete_button)
+        self._populate_band_sliders(preset)
 
     def _set_spin(self, row: int, column: int, value: float, minimum: float, maximum: float, step: float) -> None:
         spin = QDoubleSpinBox()
@@ -407,8 +823,10 @@ class MainWindow(QMainWindow):
         band.q = q_spin.value()
         band.left_gain_db = left_gain.value()
         band.right_gain_db = right_gain.value()
+        self._populate_band_sliders(preset)
         self.graph.set_preset(preset, int(self.sample_rate_combo.currentText()))
         self._apply_preset(preset)
+        self._schedule_system_eq_update()
 
     def _add_band(self) -> None:
         preset = self._current_preset()
@@ -418,6 +836,7 @@ class MainWindow(QMainWindow):
         self._populate_bands(preset)
         self.graph.set_preset(preset, int(self.sample_rate_combo.currentText()))
         self._apply_preset(preset)
+        self._schedule_system_eq_update()
 
     def _delete_band(self, row: int) -> None:
         preset = self._current_preset()
@@ -427,17 +846,25 @@ class MainWindow(QMainWindow):
         self._populate_bands(preset)
         self.graph.set_preset(preset, int(self.sample_rate_combo.currentText()))
         self._apply_preset(preset)
+        self._schedule_system_eq_update()
 
     def _apply_preset(self, preset: EqPreset, apply_system: bool = False) -> None:
         try:
             if self.dsp is not None:
                 self.dsp.set_preset(preset)
-            if apply_system and self.pipewire.active:
-                self.pipewire.update(preset, self.system_sink_combo.currentData())
-                self.system_meter.stop()
-                self._start_system_meter()
+            if self.system_bridge is not None:
+                self.system_bridge.dsp.set_preset(preset)
+                if apply_system:
+                    self.status_label.setText(f"系统输出已自动切换到：{preset.name}")
+            elif apply_system and self.pipewire.active:
+                if preset.effects.any_enabled():
+                    self._switch_to_system_effect_bridge(preset)
+                else:
+                    self.pipewire.update(preset, self.system_sink_combo.currentData())
+                    self.system_meter.stop()
+                    self._start_system_meter()
                 self.status_label.setText(f"系统输出已自动切换到：{preset.name}")
-        except (RuntimeError, ValueError) as error:
+        except (RuntimeError, OSError, ValueError) as error:
             self.status_label.setText(str(error))
 
     def _start_monitor(self) -> None:
@@ -494,10 +921,22 @@ class MainWindow(QMainWindow):
             return
         try:
             if self.pipewire.active:
-                self.pipewire.update(preset, self.system_sink_combo.currentData())
+                if self.system_bridge is not None:
+                    self.system_bridge.dsp.set_preset(preset)
+                elif preset.effects.any_enabled():
+                    self._switch_to_system_effect_bridge(preset)
+                else:
+                    self.pipewire.update(preset, self.system_sink_combo.currentData())
             else:
                 self.pipewire.activate(preset, self.system_sink_combo.currentData())
-        except (RuntimeError, OSError) as error:
+                if preset.effects.any_enabled():
+                    self._start_system_effect_bridge(preset)
+        except (RuntimeError, OSError, ValueError) as error:
+            if self.pipewire.active and self.system_bridge is None:
+                try:
+                    self.pipewire.deactivate()
+                except (RuntimeError, OSError):
+                    pass
             QMessageBox.critical(self, "无法启用系统输出", str(error))
             return
         self.state.system_output_enabled = True
@@ -507,6 +946,9 @@ class MainWindow(QMainWindow):
 
     def _disable_system_output(self) -> None:
         try:
+            if self.system_bridge is not None:
+                self.system_bridge.stop()
+                self.system_bridge = None
             self.pipewire.deactivate()
         except (RuntimeError, OSError) as error:
             QMessageBox.critical(self, "无法停用系统输出", str(error))
@@ -560,7 +1002,21 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "导出失败", str(error))
 
     def _update_status(self) -> None:
-        if self.system_meter.running:
+        if self.system_bridge is not None:
+            if self.system_bridge.last_error:
+                self.status_label.setText(f"系统效果警告: {self.system_bridge.last_error}")
+            elif not self.system_bridge.running:
+                self.status_label.setText("系统效果桥接已停止，正在重连")
+            # 桥接模式只显示真实链路：前=桥输入，后=真实声卡 monitor
+            # 不再回退到内部 processed_peak，避免有条没声的误导
+            for meter, peak in (
+                (self.system_input_meter, self.system_bridge.input_peak),
+                (self.system_eq_meter, self.system_meter.post_peak),
+            ):
+                value, text = self._meter_value(peak)
+                meter.setValue(value)
+                meter.setFormat(text)
+        elif self.system_meter.running:
             for meter, peak in (
                 (self.system_input_meter, self.system_meter.pre_peak),
                 (self.system_eq_meter, self.system_meter.post_peak),
@@ -603,8 +1059,14 @@ class MainWindow(QMainWindow):
         save_state(self.state)
 
     def closeEvent(self, event) -> None:
+        self._effect_system_timer.stop()
+        self._system_eq_update_timer.stop()
+        self._system_bridge_watchdog.stop()
         if self.monitor is not None:
             self.monitor.stop()
+        if self.system_bridge is not None:
+            self.system_bridge.stop()
+            self.system_bridge = None
         if self.pipewire.active:
             try:
                 self.pipewire.deactivate()

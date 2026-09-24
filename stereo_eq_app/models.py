@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
@@ -11,6 +12,155 @@ class FilterType(str, Enum):
     HIGH_SHELF = "high_shelf"
     LOW_PASS = "low_pass"
     HIGH_PASS = "high_pass"
+
+
+def _finite_in_range(value: float, minimum: float, maximum: float, name: str) -> None:
+    if not math.isfinite(value) or not minimum <= value <= maximum:
+        raise ValueError(f"{name}必须位于 {minimum} 到 {maximum} 之间")
+
+
+@dataclass
+class CompressorSettings:
+    enabled: bool = False
+    threshold_db: float = -24.0
+    ratio: float = 3.0
+    attack_ms: float = 10.0
+    release_ms: float = 150.0
+    knee_db: float = 3.0
+    makeup_gain_db: float = 0.0
+    mix: float = 0.85
+
+    def validate(self) -> None:
+        _finite_in_range(self.threshold_db, -60.0, 0.0, "压缩器阈值")
+        _finite_in_range(self.ratio, 1.0, 20.0, "压缩器压缩比")
+        _finite_in_range(self.attack_ms, 0.1, 2000.0, "压缩器启动时间")
+        _finite_in_range(self.release_ms, 1.0, 9000.0, "压缩器释放时间")
+        _finite_in_range(self.knee_db, 0.0, 24.0, "压缩器拐点")
+        _finite_in_range(self.makeup_gain_db, -24.0, 24.0, "压缩器补偿增益")
+        _finite_in_range(self.mix, 0.0, 1.0, "压缩器混合量")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CompressorSettings:
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            threshold_db=float(data.get("threshold_db", -24.0)),
+            ratio=float(data.get("ratio", 3.0)),
+            attack_ms=float(data.get("attack_ms", 10.0)),
+            release_ms=float(data.get("release_ms", 150.0)),
+            knee_db=float(data.get("knee_db", 3.0)),
+            makeup_gain_db=float(data.get("makeup_gain_db", 0.0)),
+            mix=float(data.get("mix", 0.85)),
+        )
+
+
+@dataclass
+class SpatialLocatorSettings:
+    enabled: bool = False
+    pan: float = 0.25
+    mix: float = 1.0
+
+    def validate(self) -> None:
+        _finite_in_range(self.pan, -1.0, 1.0, "声场定位器位置")
+        _finite_in_range(self.mix, 0.0, 1.0, "声场定位器混合量")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SpatialLocatorSettings:
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            pan=float(data.get("pan", 0.25)),
+            mix=float(data.get("mix", 1.0)),
+        )
+
+
+@dataclass
+class StereoWidenerSettings:
+    enabled: bool = False
+    width: float = 1.25
+    mix: float = 1.0
+
+    def validate(self) -> None:
+        _finite_in_range(self.width, 0.0, 2.0, "立体声扩展器宽度")
+        _finite_in_range(self.mix, 0.0, 1.0, "立体声扩展器混合量")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> StereoWidenerSettings:
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            width=float(data.get("width", 1.25)),
+            mix=float(data.get("mix", 1.0)),
+        )
+
+
+@dataclass
+class SoundBoosterSettings:
+    enabled: bool = False
+    gain_db: float = 3.0
+    mix: float = 1.0
+
+    def validate(self) -> None:
+        _finite_in_range(self.gain_db, 0.0, 12.0, "声音放大器增益")
+        _finite_in_range(self.mix, 0.0, 1.0, "声音放大器混合量")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SoundBoosterSettings:
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            gain_db=float(data.get("gain_db", 3.0)),
+            mix=float(data.get("mix", 1.0)),
+        )
+
+
+@dataclass
+class EffectSettings:
+    compressor: CompressorSettings = field(default_factory=CompressorSettings)
+    spatial_locator: SpatialLocatorSettings = field(default_factory=SpatialLocatorSettings)
+    stereo_widener: StereoWidenerSettings = field(default_factory=StereoWidenerSettings)
+    sound_booster: SoundBoosterSettings = field(default_factory=SoundBoosterSettings)
+
+    def validate(self) -> None:
+        self.compressor.validate()
+        self.spatial_locator.validate()
+        self.stereo_widener.validate()
+        self.sound_booster.validate()
+
+    def any_enabled(self) -> bool:
+        return any(
+            (
+                self.compressor.enabled,
+                self.spatial_locator.enabled,
+                self.stereo_widener.enabled,
+                self.sound_booster.enabled,
+            )
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "compressor": self.compressor.to_dict(),
+            "spatial_locator": self.spatial_locator.to_dict(),
+            "stereo_widener": self.stereo_widener.to_dict(),
+            "sound_booster": self.sound_booster.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> EffectSettings:
+        return cls(
+            compressor=CompressorSettings.from_dict(data.get("compressor", {})),
+            spatial_locator=SpatialLocatorSettings.from_dict(data.get("spatial_locator", {})),
+            stereo_widener=StereoWidenerSettings.from_dict(data.get("stereo_widener", {})),
+            sound_booster=SoundBoosterSettings.from_dict(data.get("sound_booster", {})),
+        )
 
 
 @dataclass
@@ -65,6 +215,7 @@ class EqPreset:
     preamp_db: float = 0.0
     bands: list[EqBand] = field(default_factory=list)
     built_in: bool = True
+    effects: EffectSettings = field(default_factory=EffectSettings)
 
     def validate(self, sample_rate: int) -> None:
         if not self.name.strip():
@@ -77,6 +228,7 @@ class EqPreset:
             raise ValueError("至少需要启用一个频段")
         for band in self.bands:
             band.validate(sample_rate)
+        self.effects.validate()
 
     def copy(self) -> EqPreset:
         return EqPreset(
@@ -87,6 +239,7 @@ class EqPreset:
             preamp_db=self.preamp_db,
             bands=[EqBand.from_dict(band.to_dict()) for band in self.bands],
             built_in=self.built_in,
+            effects=EffectSettings.from_dict(self.effects.to_dict()),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -98,6 +251,7 @@ class EqPreset:
             "preamp_db": self.preamp_db,
             "bands": [band.to_dict() for band in self.bands],
             "built_in": self.built_in,
+            "effects": self.effects.to_dict(),
         }
 
     @classmethod
@@ -110,6 +264,7 @@ class EqPreset:
             preamp_db=float(data.get("preamp_db", 0.0)),
             bands=[EqBand.from_dict(item) for item in data.get("bands", [])],
             built_in=bool(data.get("built_in", False)),
+            effects=EffectSettings.from_dict(data.get("effects", {})),
         )
 
 

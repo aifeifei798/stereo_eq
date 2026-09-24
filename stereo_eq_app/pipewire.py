@@ -39,10 +39,16 @@ class PipeWireController:
         self.post_monitor_source = "stereo_eq_post.monitor"
         self.previous_sink: str | None = None
         self.active = False
+        self.effect_bridge_mode = False
         self.live_updates_supported = False
-        if self.config_path.exists() and self.default_sink() == "stereo_eq_input":
-            self.active = True
-            self.previous_sink = None
+        if self.config_path.exists():
+            try:
+                self.effect_bridge_mode = "stereo_eq_effect_source" in self.config_path.read_text(encoding="utf-8")
+            except OSError:
+                self.effect_bridge_mode = False
+            if self.default_sink() == "stereo_eq_input":
+                self.active = True
+                self.previous_sink = self._first_physical_sink() if self.effect_bridge_mode else None
 
     @property
     def available(self) -> bool:
@@ -110,7 +116,7 @@ class PipeWireController:
     def _filter_node(self, index: int, band: EqBand) -> str:
         label = _FILTER_NAMES.get(band.filter_type, "bq_peaking")
         return (
-            f'{{ type = builtin name = eq_band_{index} label = {label} '
+            f'{{ type = builtin name = eq_band_{index} label = "{label}" '
             f'control = {{ "Freq" = {band.frequency:.6f} "Q" = {band.q:.6f} '
             f'"Gain" = {self._system_gain(band):.6f} }} }}'
         )
@@ -125,27 +131,75 @@ class PipeWireController:
             raise ValueError("系统级 EQ 至少需要一个启用的频段")
         if target_sink in {"stereo_eq_input", "stereo_eq_post"}:
             raise ValueError("系统输出目标不能是 Stereo EQ 自己的虚拟设备")
-        nodes: list[str] = []
-        links: list[str] = []
-        current_node = ""
-        first_node = ""
-        if abs(preset.preamp_db) > 0.001:
-            nodes.append(
-                '{ type = builtin name = eq_preamp label = bq_highshelf '
-                f'control = {{ "Freq" = 0.0 "Q" = 1.0 "Gain" = {preset.preamp_db:.6f} }} }}'
-            )
-            current_node = "eq_preamp"
-            first_node = current_node
-        for index, band in enumerate(enabled_bands, start=1):
-            node_name = f"eq_band_{index}"
-            if not first_node:
-                first_node = node_name
-            nodes.append(self._filter_node(index, band))
-            if current_node:
-                links.append(f'{{ output = "{current_node}:Out" input = "{node_name}:In" }}')
-            current_node = node_name
-        target = self._quote(target_sink)
-        content = f'''context.modules = [
+        use_bridge = self.effect_bridge_mode or preset.effects.any_enabled()
+        self.effect_bridge_mode = use_bridge
+
+        if use_bridge:
+            # PipeWire 1.0.x 没有可用的 FFmpeg filtergraph。这里只创建一个
+            # 虚拟输入，Python 的 SystemEffectBridge 负责 EQ 和动态效果，
+            # 再通过 pacat 输出到真实声卡，避免依赖 LADSPA/FFmpeg 插件。
+            nodes = ['{ type = builtin name = stereo_eq_bridge_copy label = "copy" }']
+            graph_inputs = ["stereo_eq_bridge_copy:In"]
+            graph_outputs = ["stereo_eq_bridge_copy:Out"]
+            content = f'''context.modules = [
+  {{
+    name = libpipewire-module-filter-chain
+    args = {{
+      node.name = "stereo_eq"
+      node.description = "Stereo EQ"
+      media.name = "Stereo EQ"
+      audio.rate = 48000
+      audio.channels = 2
+      audio.position = [ FL FR ]
+      filter.graph = {{
+        nodes = [
+          {" ".join(nodes)}
+        ]
+        links = [
+        ]
+        inputs = [ {" ".join(f'"{value}"' for value in graph_inputs)} ]
+        outputs = [ {" ".join(f'"{value}"' for value in graph_outputs)} ]
+      }}
+      capture.props = {{
+        node.name = "stereo_eq_input"
+        media.class = Audio/Sink
+        audio.channels = 2
+        audio.position = [ FL FR ]
+      }}
+      playback.props = {{
+        node.name = "stereo_eq_effect_source"
+        media.class = Audio/Source
+        audio.channels = 2
+        audio.position = [ FL FR ]
+      }}
+    }}
+  }}
+]
+'''
+        else:
+            nodes = []
+            links: list[str] = []
+            first_node = ""
+            current_node = ""
+            if abs(preset.preamp_db) > 0.001:
+                nodes.append(
+                    '{ type = builtin name = eq_preamp label = "bq_highshelf" '
+                    f'control = {{ "Freq" = 0.0 "Q" = 1.0 "Gain" = {preset.preamp_db:.6f} }} }}'
+                )
+                current_node = "eq_preamp"
+                first_node = current_node
+            for index, band in enumerate(enabled_bands, start=1):
+                node_name = f"eq_band_{index}"
+                if not first_node:
+                    first_node = node_name
+                nodes.append(self._filter_node(index, band))
+                if current_node:
+                    links.append(f'{{ output = "{current_node}:Out" input = "{node_name}:In" }}')
+                current_node = node_name
+            graph_inputs = [f"{first_node}:In"]
+            graph_outputs = [f"{current_node}:Out"]
+            target = self._quote(target_sink)
+            content = f'''context.modules = [
   {{
     name = libpipewire-module-filter-chain
     args = {{
@@ -162,8 +216,8 @@ class PipeWireController:
         links = [
           {" ".join(links)}
         ]
-        inputs = [ "{first_node}:In" ]
-        outputs = [ "{current_node}:Out" ]
+        inputs = [ {" ".join(f'"{value}"' for value in graph_inputs)} ]
+        outputs = [ {" ".join(f'"{value}"' for value in graph_outputs)} ]
       }}
       capture.props = {{
         node.name = "stereo_eq_input"
@@ -204,18 +258,25 @@ class PipeWireController:
   }}
 ]
 '''
+
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.config_path.with_suffix(".tmp")
         temporary.write_text(content, encoding="utf-8")
         temporary.replace(self.config_path)
 
     def _restart_pipewire(self) -> None:
-        result = subprocess.run(
-            ["systemctl", "--user", "restart", "pipewire", "wireplumber"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        command = ["systemctl", "--user", "restart", "pipewire", "wireplumber"]
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            # PipeWire may be in a restart backoff after a bad generated config.
+            # Clear that state before trying the same restart once more.
+            subprocess.run(
+                ["systemctl", "--user", "reset-failed", "pipewire", "wireplumber"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or "重启 PipeWire 失败")
 
@@ -276,6 +337,12 @@ class PipeWireController:
             temporary = self.config_path.with_suffix(".tmp")
             temporary.write_text(old_config, encoding="utf-8")
             temporary.replace(self.config_path)
+        subprocess.run(
+            ["systemctl", "--user", "reset-failed", "pipewire", "wireplumber"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
         self._restart_pipewire()
         if previous_sink and previous_sink not in {"stereo_eq_input", "stereo_eq_post"}:
             self._wait_for_sink(previous_sink)
@@ -294,12 +361,17 @@ class PipeWireController:
         try:
             self._write_config(preset, routing_target)
             self._restart_pipewire()
-            if not self._wait_for_sink("stereo_eq_input") or not self._wait_for_sink("stereo_eq_post"):
-                raise RuntimeError("Stereo EQ 前后级虚拟输出没有成功创建")
+            if not self._wait_for_sink("stereo_eq_input"):
+                raise RuntimeError("Stereo EQ 输入虚拟输出没有成功创建")
+            if not self.effect_bridge_mode and not self._wait_for_sink("stereo_eq_post"):
+                raise RuntimeError("Stereo EQ 后级虚拟输出没有成功创建")
             self._set_default_sink("stereo_eq_input")
         except (OSError, RuntimeError, ValueError) as error:
             try:
                 self._restore_after_failure(old_config, previous_sink)
+                self.effect_bridge_mode = (
+                    old_config is not None and "stereo_eq_effect_source" in old_config
+                )
             except (OSError, RuntimeError) as restore_error:
                 raise RuntimeError(f"系统输出启用失败，自动恢复也失败: {restore_error}") from error
             self.active = False
@@ -311,6 +383,9 @@ class PipeWireController:
         if not self.active:
             self.activate(preset, target_sink)
             return
+        if self.effect_bridge_mode:
+            # EQ and dynamic effects are processed by SystemEffectBridge in Python.
+            return
         if not self.available:
             raise RuntimeError(self.compatibility_error)
         old_config = self.config_path.read_text(encoding="utf-8")
@@ -320,18 +395,24 @@ class PipeWireController:
         try:
             self._write_config(preset, target_sink or previous_sink or "")
             self._restart_pipewire()
-            if not self._wait_for_sink("stereo_eq_input") or not self._wait_for_sink("stereo_eq_post"):
-                raise RuntimeError("Stereo EQ 前后级虚拟输出没有成功创建")
+            if not self._wait_for_sink("stereo_eq_input"):
+                raise RuntimeError("Stereo EQ 输入虚拟输出没有成功创建")
+            if not self.effect_bridge_mode and not self._wait_for_sink("stereo_eq_post"):
+                raise RuntimeError("Stereo EQ 后级虚拟输出没有成功创建")
             self._set_default_sink("stereo_eq_input")
         except (OSError, RuntimeError, ValueError) as error:
             try:
                 self._restore_after_failure(old_config, previous_sink)
+                self.effect_bridge_mode = (
+                    old_config is not None and "stereo_eq_effect_source" in old_config
+                )
             except (OSError, RuntimeError) as restore_error:
                 raise RuntimeError(f"系统输出更新失败，自动恢复也失败: {restore_error}") from error
             raise RuntimeError(f"系统输出更新失败，已恢复原声卡: {error}") from error
 
     def deactivate(self) -> None:
         if not self.active and not self.config_path.exists():
+            self.effect_bridge_mode = False
             return
         previous_sink = self.previous_sink or self.default_sink()
         if previous_sink in {"stereo_eq_input", "stereo_eq_post"}:
@@ -355,3 +436,4 @@ class PipeWireController:
                 raise RuntimeError(f"系统输出停用失败，自动恢复也失败: {restore_error}") from error
             raise RuntimeError(f"系统输出停用失败，已恢复原声卡: {error}") from error
         self.active = False
+        self.effect_bridge_mode = False
